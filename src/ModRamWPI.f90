@@ -574,10 +574,10 @@ MODULE ModRamWPI
   END SUBROUTINE WAPARA_BAS
 
 !************************************************************************
-!                       WAVELO
+!                       WAVELO_LEGACY
 !       Calculate loss due to waves everywhere using electron lifetimes
 !************************************************************************
-  SUBROUTINE WAVELO(S)
+  SUBROUTINE WAVELO_LEGACY(S)
 
     use ModRamMain,      ONLY: DP
     use ModRamParams,    ONLY: DoUsePlasmasphere
@@ -633,8 +633,373 @@ MODULE ModRamWPI
 
     DEALLOCATE(RLpp)
     RETURN
-  END SUBROUTINE WAVELO
+  END SUBROUTINE WAVELO_LEGACY
 
+ 
+!************************************************************************
+!                       WAVELO
+!        To fix: for chorus waves we use here Orlov & Shprits (2014)
+!        Note that the model is valid for R0 = 3-8,Kp = 0-6, 
+!        E = 1 keV-2 MeV. For now for hight Kp we use Kp=6 losses,
+!        for R0 < 3, R0 = 3, etc. 
+!
+!************************************************************************
+  subroutine wavelo(s)
+
+    use ModRamMain,      ONLY: DP
+    use ModRamParams,    ONLY: DoUsePlasmasphere
+    use ModRamGrids,     ONLY: NE, NR, NT, NPA
+    use ModRamTiming,    ONLY: Dts
+    use ModRamVariables, ONLY: F2, Kp, Kpmax12, LZ, MLT, EKEV, NECR, &
+                                WALOS1, WALOS2, WALOS3
+
+    implicit none
+
+    integer, intent(in) :: S
+    integer :: i, j, k, l
+    real(DP) :: tau_lif, logtau, Bw
+    real(DP), ALLOCATABLE :: RLpp(:)
+    real(DP), dimension(33) :: coeff, rke_array
+
+    ALLOCATE(RLpp(nT))
+    RLpp = 0.0
+    Bw=30.
+    IF (KP.GE.4.0) Bw=100.
+ 
+    do j=1,NT
+      RLpp(j) = 5.39 - 0.382*Kpmax12  ! PP from Moldwin et al. [2002]
+      do i = 2,NR
+        if (DoUsePlasmasphere .and. NECR(i,j) < 50.) then
+            RLpp(j) = LZ(i-1)
+            exit
+        end if
+      end do
+    end do
+
+    do k=2,NE
+      do i=2,NR
+        do j=1,NT
+          do l=2,NPA
+            if (Lz(i) <= RLpp(j)) then
+              tau_lif=WALOS1(I,K)*((10./Bw)**2)
+ !             E = log10(EkeV(k)*0.001)
+ !             fL = 0.1328*Lz(i)**2 - 2.1463*Lz(i) + 3.7857
+ !             if (E >= fL) then
+ !               call hiss_tauel(Lz(i), MLT(j), E, Kp, tau_hiss)
+ !               tau_lif = tau_hiss*3600*24
+ !             else
+ !               tau_lif = 3000.0*3600*24
+ !             end if
+               F2(s,i,j,k,l)=F2(s,i,j,k,l)*EXP(-DTs/tau_lif)
+            else if (Lz(i) > RLpp(j)) then
+              call chorus_tauel_coeff(MLT(j), EkeV(k), Kp, coeff)
+              call rke_terms(Lz(i), Kp + 1, EkeV(k)*0.001, rke_array)
+              logtau = sum(coeff*rke_array)
+              tau_lif = 10**logtau ! lifetime in days
+              tau_lif = tau_lif*3600*24
+            end if
+            if (MLT(j) > 15 .and. MLT(j) < 21) then 
+              F2(s,i,j,k,l) = F2(s,i,j,k,l)
+            else
+              F2(s,i,j,k,l) = F2(s,i,j,k,l)*exp(-DTs/tau_lif)
+            end if
+          end do
+        end do
+      end do
+    end do
+
+    deallocate(RLpp)
+    return
+
+  end subroutine wavelo
+
+  subroutine hiss_tauel(R, mlt, E, Kp, tau_hiss)
+    use ModRamMain, ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: R, mlt, E, Kp
+    real(DP), intent(out) :: tau_hiss
+
+    real(DP) :: tau_hiss_av, g, h
+
+    call hiss_tauel_av(R, E, tau_hiss_av)
+    call gmlt(mlt, g)
+    call hKp(Kp, h)
+    tau_hiss = tau_hiss_av/(g*h)
+
+  end subroutine hiss_tauel
+
+  subroutine hiss_tauel_av(R, E, tau_hiss_av)
+    use ModRamMain, ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: R, E
+    real(DP), intent(out) :: tau_hiss_av
+
+    real(DP), dimension(20) :: a_coeff, EL_coeff
+
+    a_coeff(:) = (/ 77.323, -92.641, -55.754, 44.497, 48.981, 8.9067, -10.704,&
+                  -15.711, -3.3326, 1.5189, 1.294, 2.2546, 0.31889, -0.85916,&
+                  -0.22182, 0.034318, 0.097248, -0.12192, -0.062765, 0.0063218 /)
+
+    EL_coeff(:) = (/ 1.0, R, E, R**2, R*E, E**2, R**3, R**2*E, R*E**2, E**3,&
+                   R**4, R**3*E, R**2*E**2, R*E**3, E**4, R*E**4, R**2*E**3,&
+                   R**4*E, R**5, E**5 /)
+
+    tau_hiss_av = 10**(sum(a_coeff*EL_coeff))
+  end subroutine hiss_tauel_av
+
+  subroutine gmlt(mlt, g)
+    use ModRamMain, ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: mlt
+    real(DP), intent(out) :: g
+
+    real(DP) :: g0mlt, G0, b2, b1, b0
+
+    G0 = 782.3
+    b2 = -0.007338
+    b1 = 0.1773
+    b0 = 2.080
+
+    g0mlt = b2*mlt**2 + b1*mlt + b0
+    g = (1/G0) * (10**g0mlt)
+
+  end subroutine gmlt
+
+  subroutine hKp(Kp, h)
+    use ModRamMain, ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: Kp
+    real(DP), intent(out) :: h
+
+    real(DP) :: h0Kp, H0, c2, c1, c0, K
+
+    H0 = 1315
+    c2 = -0.01414
+    c1 = 0.2321
+    c0 = 2.598
+
+    if (Kp <= 5) then
+      K = Kp
+    else
+      K = 5
+    end if
+    
+    h0Kp = c2*K**2 + c1*K + c0
+    h = (1/H0) * (10**h0Kp)
+
+  end subroutine hKp
+  
+
+  !***********************************************************************
+  !   Calculate coefficients for Orlova & Shprits (2014) model of
+  !   elctron lifetimes due to scattering by chorus waves 
+  !***********************************************************************
+  subroutine chorus_tauel_coeff(mlt, E, Kp, coeff)
+    use ModRamMain, ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: mlt, E, Kp
+    real(DP), dimension(33), intent(out) :: coeff
+
+    real(DP) :: coeffNight(5,33), coeffDawn(3,33), coeffPrenoon(3,33),&
+                coeffPostnoon(3,33)
+
+    coeffNight(1,:) = (/ -6.298, 2.475, -0.72639, 86.973, -1571.8, -0.015397,&
+                       -1.253, 0.0011662, -319.94, -5.9866, 0.0, -0.32751,&
+                       0.090541, -4.7742, 0.0015693, 11.896, 1073.2, 0.01501,&
+                       -0.0039606, 0.0, 2.1137, -424.7, 26441.0, -988010.0,&
+                       -0.088225, 8.6697, 419.1, 0.0047009, -0.79409, 2025.4,&
+                       -147880.0, 5629200.0, 0.0 /)
+    
+    coeffNight(2,:) = (/ 9.2456, -3.7685, 1.2559, 0.040296, 1.1833, -0.10843,&
+                       0.0, 0.013698, 16.075, -19.866, 8.134, 0.54406, -0.16616,&
+                       -0.091841, 0.0, -1.6971, 0.99102, -0.028145, 0.0092606,&
+                       0.058892, -3.5674, -9.0573, -17.686, 10.029, 0.6322,&
+                       7.368, 0.0, -0.085533, -1.0005, -31.398, 88.895, -59.737, 0.0 /)
+                      
+    coeffNight(3,:) = (/ -3.8064, -1.0616, -0.50282, -0.93478, 0.0, 0.15969,&
+                       -0.081421, -0.0081014, 27.262, -10.554, 2.3565, 0.4421,&
+                       -0.059054, 0.15542, -0.0027346, -4.05, 0.9056, -0.028424,&
+                       0.0049602, 0.14818, 4.1008, -55.812, 10.392, 0.0, -0.85125,&
+                       9.9087, -0.83409, 0.044016, -0.53404, 82.36, -76.472,&
+                       158.86, -148.75 /)
+
+    coeffNight(4,:) = (/ 9.4941, -4.608, 1.9814, -0.35458, 0.10723, 0.15431,&
+                       -0.015408, -0.011301, 3.1246, -0.067317, -0.088908,&
+                       0.91137, -0.37474, 0.0063232, -0.0063599, -0.36853, 0.0,&
+                       -0.061111, 0.021043, 0.018011, -7.9589, 2.0, 0.93541,&
+                       -0.42571, 2.037, 1.0634, 0.0, -0.30541, -0.13225, 9.441,&
+                       -12.231, 5.0008, -0.5057 /)
+                       
+    coeffNight(5,:) = (/ -22.631, 11.693, -4.6909, -0.24701, 0.033458, 0.98105,&
+                       0.0, -0.055868, 3.8379, -0.85239, 0.0, -0.090658, -0.15869,&
+                       0.0090052, -0.0079675, -0.35965, 0.068028, -0.034443,&
+                       0.018795, 0.0051132, 10.647, -11.332, 0.13953, -0.06843,&
+                       -2.1683, 2.0908, 0.0, 0.12855, -0.12191, 19.956, 0.39078,&
+                       -0.27118, 0.19286 /)
+                            
+
+
+    coeffDawn(1,:) = (/ 13.023, -5.1397, 0.36629, -114.33, 5231.2, -0.004326,&
+                      1.7987, 0.0, 2364.7, -237100.0, 8168000.0, 0.66154,&
+                      -0.035386, 4.475, 0.0, -223.63, 9035.4, -0.029805,&
+                      0.0013554, 8.0424, -1.788, 568.06, -63536.0, 2307700.0,&
+                      0.076799, -16.838, 1334.8, 0.0, 0.0, -6518.8, 923510.0,&
+                      -42788000.0, 0.0 /)
+
+    coeffDawn(2,:) = (/ 3.0872, 0.44092, -0.34824, 2.835, -10.838, 0.013725,&
+                    -0.06885, 0.0, 23.283, -426.74, 1219.8, -0.14119, 0.039748,&
+                    -0.100111, -0.00074614, -1.0401, 24.774, 0.010743, -0.0016182,&
+                    -0.091657, 0.015684, -12.221, 22.634, 396.6, 0.0037368, 0.79364,&
+                    -3.8069, 0.0011614, 0.0, -170.6, 4947.6, -49439.0, 181330.0 /)
+
+    coeffDawn(3,:) = (/ 4.0112, -0.39094, -0.03256, -0.037959, -0.0062679, 0.0052271,&
+                      0.001263, -0.00017601, 0.10032, 0.07421, 0.011347, 0.040335,&
+                      0.0055705, 0.003349, -0.00038591, -0.02609, -0.0065557,&
+                      -0.0024257, -0.0002716, 0.0015915, -0.93675, 0.057597,&
+                      0.056129, -0.0087605, 0.059057, -0.0068603, 0.0014772,&
+                      0.0010756, -0.00031907, 3.4193, -2.9549, 1.257, -0.24123 /)   
+
+    
+    coeffPrenoon(1,:) = (/ 9.3791, -3.3801, 0.2295, -21.044, 3237.3, -0.014983,&
+                         -1.3745, 0.0, 1956.3, -260190.0, 12551000.0, 0.40549,&
+                         -0.016404, 0.0, 0.0014003, -180.88, 6908.2, -0.018219,&
+                         0.0, 7.9534, -1.4482, 280.49, -32982.0, 0.0, 0.10963,&
+                         -19.436, 2541.5, 0.0, 0.0, -4987.2, 843540.0, -44455000.0, 0.0 /)
+    
+    coeffPrenoon(2,:) = (/ 6.8865, -1.6632, -0.018769, -0.4048, -4.0194, -0.0047973,&
+                         0.0, 0.00049759, 37.493, -184.03, 0.0, 0.14847, 0.0099013,&
+                         0.088663, 0.0, -3.6665, 16.119, -0.0025242, -0.00098309,&
+                         0.045456, -0.30072, 3.9614, -49.548, 376.0, 0.018935,&
+                         -0.073137, 0.0, -0.0012688, 0.0, -217.92, 3729.6,&
+                         -34125.0, 127070.0 /)
+    
+    coeffPrenoon(3,:) = (/ 0.37772, 0.31909, -0.097241, 0.052829, -0.0054941, 0.01252,&
+                         -0.0045574, -0.00014461, -0.11659, 0.090307, 0.004568,&
+                         -0.056582, 0.0079453, -0.001957, -0.00090294, -0.016334,&
+                         -0.0049014, 0.0014537, 0.0, 0.0030733, 0.051883, -0.23224,&
+                         0.083002, -0.018977, -0.033829, 0.018878, -0.001079,&
+                         0.00042082, 0.0, 4.7071, -4.0683, 1.8424, -0.33505 /)
+
+    
+    coeffPostnoon(1,:) = (/5.4927, -1.2239, 0.1676, -32.412, 4524.0, -0.013993,&
+                          -1.1361, 0.0 ,1181.8, -211750.0, 13923000.0, 0.079532 ,&
+                          -0.0075973, 0.0, 0.0009959, -81.463, 1780.8, -0.0038066,&
+                          0.0, 4.754, -1.4015, 478.46, -84497.0, 3569700.0, 0.14088,&
+                          -26.347, 3597.9, -0.0022453 ,0.0, -3681.7, 858490.0,&
+                          -60968000.0, 0.0 /)
+
+    coeffPostnoon(2,:) = (/ 5.2583, -0.99398, -0.10343, 0.2155, -5.8931, -0.0060298,&
+                          0.01832, 0.00051372, 34.572, -167.45, -208.86, 0.06291 ,&
+                          0.022672, 0.040741, 0.0, -3.9241, 19.809, 0.001487,&
+                          -0.0015407, 0.05622, -0.050128, -0.13125, -12.771, 293.38,&
+                          0.02575, -0.016043, -1.2529, -0.0017619, 0.0, -174.2,&
+                          3267.4, -32412.0, 130380.0 /)
+
+    coeffPostnoon(3,:) = (/ 0.85672, 0.41383, -0.11487, 0.052481, -0.0057176,&
+                          0.013318, -0.0052097, -0.00012685, -0.066638, 0.15784,&
+                          -0.0042214, -0.075598, 0.010877, -0.0015561, -0.00097701,&
+                          -0.035035, -0.008202, 0.0025751, -0.00015869, 0.0044586,&
+                          0.14084, -0.25711, 0.092002, -0.017677, -0.036853,&
+                          0.025471, -0.0033818, 0.00032439, 0.0, 4.8355, -4.46,&
+                          1.9887, -0.35605 /)
+
+    if (mlt >= 21 .or. mlt <= 3) then
+       
+       if (E <= 10) then
+          coeff(:) = coeffNight(1,:)
+       else if (E > 10 .and. E < 500 .and. Kp <= 3) then
+          coeff(:) = coeffNight(2,:)
+       else if (E > 10 .and. E < 500 .and. Kp > 3) then
+          coeff(:) = coeffNight(3,:)
+       else if (E >= 500 .and. Kp <= 3) then
+          coeff(:) = coeffNight(4,:)
+       else if (E >= 500 .and. Kp > 3) then
+          coeff(:) = coeffNight(5,:)
+       end if
+       
+    else if (mlt > 3 .and. mlt <=9) then
+       
+       if (E < 7) then
+          coeff(:) = coeffDawn(1,:)
+       else if(E >= 7 .and. E < 90) then
+          coeff(:) = coeffDawn(2,:)
+       else if (E >=90) then
+          coeff(:) = coeffDawn(3,:)
+       end if
+       
+    else if (mlt > 9 .and. mlt <= 12) then
+       
+       if (E < 7) then
+          coeff(:) = coeffPrenoon(1,:)
+       else if (E >= 7 .and. E < 100) then
+          coeff(:) = coeffDawn(2,:)
+       else if (E >= 100) then
+          coeff(:) = coeffDawn(3,:)
+       end if
+       
+    else if (mlt > 12 .and. mlt <=15) then
+       
+       if (E < 6) then
+          coeff(:) = coeffPostnoon(1,:)
+       else if (E>=6 .and. E < 100) then
+          coeff(:) = coeffPostnoon(2,:)
+       else if (E >= 100) then
+          coeff(:) = coeffPostnoon(3,:)
+       end if
+       
+    else
+       coeff(:) = 0
+    end if
+    
+  end subroutine chorus_tauel_coeff
+
+  subroutine rke_terms(R, Kp1, E, rke_array)
+    use ModRamMain,      ONLY: DP
+
+    implicit none
+
+    real(DP), intent(in) :: R, Kp1, E
+    real(DP), dimension(33), intent(out) :: rke_array
+    real(DP) :: K, R1, E1
+
+    if (Kp1 > 7) then
+       K = 7
+    else
+       K = Kp1
+    end if
+    
+    if (R < 3) then
+        R1 = 3
+    else
+        R1 = R
+    end if
+
+    if (E < 1e-3) then
+        E1 = 1e-3
+    else
+        E1 = E
+    end if
+    
+    rke_array(:) = (/ 1.0, R1, R1*K, R1*K*E1, R1*K*E1**2, R1*K**2, R1*K**2*E1, R1*K**3, R1*E1,&
+                    R1*E1**2, R1*E1**3, R1**2, R1**2*K, R1**2*K*E1, R1**2*K**2, R1**2*E1,&
+                    R1**2*E1**2, R1**3, R1**3*K, R1**3*E1, K, K*E1, K*E1**2,&
+                    K*E1**3, K**2, K**2*E1, K**2*E1**2, K**3, K**3*E1, E1,&
+                    E1**2, E1**3, E1**4 /)
+    
+  end subroutine rke_terms
+  
+      
+   
 !*************************************************************************
 !                               WPADIF
 !     Routine calculates the decay of the distribution function
